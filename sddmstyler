@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DEFAULT_NAME="custom"
+KEY_SPELLINGS="background Background Wallpaper BackgroundPath Image"
+SDDM_CONF_CANDIDATES=(
+    "/etc/sddm.conf"
+    /etc/sddm.conf.d/*.conf
+    /usr/lib/sddm/sddm.conf.d/*.conf
+    /usr/local/etc/sddm.conf
+)
+
+say() { printf '%s\n' "$*"; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    cat <<'EOF'
+Usage: sddmstyler [options]
+
+Changes the wallpaper of the active SDDM theme, system-wide, for all users.
+You will be asked for your sudo password to apply the change.
+
+Options:
+  -f, --file <path>      Local wallpaper image or video file. If omitted, you
+                         are prompted to enter a path.
+  -n, --name <name>      Base name used inside the theme. Default: custom
+  -t, --theme <name>     SDDM theme to modify (skips auto-detection).
+  -a, --absolute         Store the wallpaper in /usr/share/wallpapers and
+                         reference it by absolute path instead of inside the theme.
+  -h, --help             Show this help.
+
+Examples:
+  sddmstyler
+  sddmstyler -f ~/Pictures/wall.jpg
+  sddmstyler -f ~/Pictures/wall.jpg -n ocean
+EOF
+}
+
+normalize_path() {
+    case "$1" in
+        "~"|"~/"*) echo "$HOME${1#\~}" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+# --- theme detection ---------------------------------------------------------
+detect_theme() {
+    local f v
+    if [ -n "${SDDM_CONF_FILES:-}" ]; then
+        # readonly test hook: space-separated file list
+        for f in $SDDM_CONF_FILES; do
+            [ -f "$f" ] || continue
+            v="$(sed -n 's/^[[:space:]]*Current[[:space:]]*=*//p' "$f" | tr -d '"' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+            [ -n "$v" ] && { echo "$v"; return 0; }
+        done
+    fi
+    for f in "${SDDM_CONF_CANDIDATES[@]}"; do
+        [ -f "$f" ] || continue
+        v="$(sed -n 's/^[[:space:]]*Current[[:space:]]*=*//p' "$f" | tr -d '"' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        [ -n "$v" ] && { echo "$v"; return 0; }
+    done
+    return 1
+}
+
+theme_dir() {
+    local t="$1"
+    local b
+    if [ -n "${SDDM_THEME_DIR:-}" ] && [ -d "$SDDM_THEME_DIR" ]; then
+        echo "$SDDM_THEME_DIR"
+        return 0
+    fi
+    for b in /usr/share/sddm/themes /usr/lib/sddm/themes /usr/local/share/sddm/themes; do
+        if [ -d "$b/$t" ]; then echo "$b/$t"; return 0; fi
+    done
+    return 1
+}
+
+# --- helpers used by the root applier ---------------------------------------
+pick_keyname() {
+    local cfg="$1" k
+    for k in $KEY_SPELLINGS; do
+        grep -qE "^[[:space:]]*${k}[[:space:]]*=" "$cfg" 2>/dev/null && { echo "$k"; return; }
+    done
+    echo "background"
+}
+
+has_configs_dir() { [ -d "$SDDM_THEME_DIR/configs" ]; }
+
+ref_value() {
+    local name="$1"
+    if [ "$SDDM_REF_MODE" = "absolute" ]; then
+        echo "$SDDM_BGDIR/$name"
+    else
+        echo "$name"
+    fi
+}
+
+apply_to_file() {
+    local cfg="$1" key="$2" ref="$3" backup="$4" awkprogram o
+    [ -f "$cfg" ] || return 0
+    [ -n "$backup" ] && cp -a "$cfg" "$cfg.bak"
+
+    awkprogram='
+BEGIN { matched = 0 }
+{
+    if (length($0) > 0 && (substr($0, 1, 1) ~ /[[:space:]\t]/)) {
+        print; next
+    }
+    m = match($0, /^([^[:space:]=]+)[[:space:]]*=/)
+    if (m) {
+        keytok = substr($0, RSTART, RLENGTH)
+        sub(/[[:space:]]*=.*/, "", keytok)
+        if (toupper(keytok) == toupper(key)) {
+            match($0, /^[^[:space:]]*[[:space:]]*=[[:space:]]*/)
+            prefix = substr($0, RSTART, RLENGTH)
+            quoted = (substr($0, length($0), 1) == "\"")
+            if (quoted) prefix = prefix "\""
+            $0 = prefix ref (quoted ? "\"" : "")
+            matched = 1
+        }
+    }
+    print
+}
+END {
+    if (!matched) {
+        printf "[General]\n%s = \"%s\"\n", key, ref
+    }
+}
+'
+    awk -v key="$key" -v ref="$ref" "$awkprogram" "$cfg" > "$cfg.tmp" || die "failed to process $cfg"
+    mv "$cfg.tmp" "$cfg"
+    say "  updated $cfg"
+}
+
+# --- root applier: everything that needs privileges --------------------------
+apply() {
+    local src="$1" name="$2" theme tdir cfg key
+    local srcnorm ext reftype NEEDNAME
+    srcnorm="$(normalize_path "$src")"
+    [ -f "$srcnorm" ] || die "wallpaper file not found: $src"
+    ext="${SDDM_WALL_EXT:-}"
+    [ -n "$ext" ] || { ext="${srcnorm##*.}"; ext="$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')"; }
+
+    case "$ext" in
+        jpg|jpeg|png|webp|gif|bmp|mp4|webm|mkv|mov|m4v) : ;;
+        *) die "unsupported wallpaper type: .$ext" ;;
+    esac
+
+    theme="${SDDM_THEME_NAME:-}"
+    if [ -z "$theme" ]; then
+        theme="$(detect_theme)" || die "could not detect active SDDM theme"
+    fi
+    tdir="$(theme_dir "$theme")" || die "theme directory not found for '$theme'"
+
+    SDDM_THEME_DIR="$tdir"
+    if [ "$SDDM_REF_MODE" = "absolute" ]; then
+        SDDM_BGDIR="/usr/share/wallpapers"
+    elif [ -d "$tdir/backgrounds" ]; then
+        SDDM_BGDIR="$tdir/backgrounds"
+    else
+        SDDM_BGDIR="/usr/share/wallpapers"
+        SDDM_REF_MODE="absolute"
+    fi
+
+    mkdir -p "$SDDM_BGDIR"
+    NEEDNAME="${name}.${ext}"
+    install -m 0644 "$srcnorm" "$SDDM_BGDIR/$NEEDNAME"
+    say ">> Wallpaper installed: $SDDM_BGDIR/$NEEDNAME"
+    say ">> Theme: $theme"
+
+    reftype="$(ref_value "$NEEDNAME")"
+
+    if has_configs_dir && compgen -G "$tdir/configs/*.conf" >/dev/null; then
+        for cfg in "$tdir"/configs/*.conf; do
+            key="$(pick_keyname "$cfg")"
+            apply_to_file "$cfg" "$key" "$reftype" "$cfg.bak"
+        done
+    else
+        for cfg in "$tdir/theme.conf" "$tdir/theme.conf.user"; do
+            [ -f "$cfg" ] || continue
+            key="$(pick_keyname "$cfg")"
+            apply_to_file "$cfg" "$key" "$reftype" "1"
+        done
+    fi
+
+    say ">> Done. Preview:  sddm-greeter --test --theme $tdir"
+    say "   Apply on next boot, or after logging out:  sudo systemctl restart sddm"
+}
+
+# --- root / privileged dispatch ------------------------------------------
+if [ "$(id -u)" -eq 0 ] || [ "${SDDM_SKIP_RECHECK:-0}" = "1" ]; then
+    BRIDGE="${1:-}"
+    [ -f "$BRIDGE" ] || die "lost context between the password prompt and this run; try again."
+    { read -r src; read -r SDDM_WALL_NAME; read -r SDDM_REF_MODE; read -r SDDM_THEME_NAME; read -r SDDM_WALL_EXT; } < "$BRIDGE"
+    trap 'rm -f "$BRIDGE"' EXIT
+    apply "$src" "$SDDM_WALL_NAME"
+    exit 0
+fi
+
+SRC=""
+NAME="$DEFAULT_NAME"
+THEME_OVERRIDE=""
+REF_MODE="relative"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        -f|--file) SRC="$2"; shift 2 ;;
+        -n|--name) NAME="$2"; shift 2 ;;
+        -t|--theme) THEME_OVERRIDE="$2"; shift 2 ;;
+        -a|--absolute) REF_MODE="absolute"; shift ;;
+        -f=*) SRC="${1#*=}"; shift ;;
+        -n=*) NAME="${1#*=}"; shift ;;
+        -t=*) THEME_OVERRIDE="${1#*=}"; shift ;;
+        *) die "unknown option: $1" ;;
+    esac
+done
+
+if [ -z "$SRC" ]; then
+    printf 'Wallpaper file path (Ctrl-C to cancel): '
+    read -r SRC
+    [ -n "$SRC" ] || die "no wallpaper given"
+fi
+
+[ -e "$SRC" ] || die "wallpaper file not found: $SRC"
+
+EXT="$(printf '%s' "${SRC##*.}" | tr '[:upper:]' '[:lower:]')"
+BRIDGE="$(mktemp)"
+printf '%s\n%s\n%s\n%s\n%s\n' "$SRC" "$NAME" "$REF_MODE" "$THEME_OVERRIDE" "$EXT" > "$BRIDGE"
+
+say ">> sddmstyler needs root to modify the SDDM theme ..."
+SELF="$(readlink -f -- "$0")"
+exec sudo -S -p "Password for sddmstyler: " -H bash "$SELF" "$BRIDGE"
+
+# unreachable (bash will not get here after exec)
