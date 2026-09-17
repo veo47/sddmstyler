@@ -13,14 +13,17 @@ and it's applied. No theme editing by hand.
 
 ## Install
 
+Install straight from the repository (downloads the latest version from GitHub):
+
 ```sh
-sudo install -m 755 -o root -g root sddmstyler /usr/local/bin/sddmstyler
+sudo ./install.sh                                          # from a clone
+curl -fsSL https://raw.githubusercontent.com/veo47/sddmstyler/main/install.sh | sudo sh
 ```
 
-Or with the helper:
+Or manually, from the repo folder:
 
 ```sh
-sudo ./install.sh
+install -m 755 sddmstyler /usr/local/bin/sddmstyler
 ```
 
 ## Usage
