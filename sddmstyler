@@ -38,7 +38,7 @@ EOF
 
 normalize_path() {
     case "$1" in
-        "~"|"~/"*) echo "$HOME${1#\~}" ;;
+        ~"|"~/"*) echo "$HOME${1#\~}" ;;
         *) echo "$1" ;;
     esac
 }
